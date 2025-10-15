@@ -1,0 +1,6 @@
+flask
+gunicorn
+google-cloud-vertexai
+Flask-Cors
+google-cloud-aiplatform
+flask-cors
