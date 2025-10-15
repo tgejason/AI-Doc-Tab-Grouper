@@ -1,0 +1,33 @@
+{
+    "manifest_version": 3,
+    "name": "AI Doc Tab Grouper (MVP)",
+    "version": "1.0",
+    "description": "Groups document tabs using AI via GCP.",
+    "icons": {
+        "48": "icon48.png" 
+    },
+    "action": {
+        "default_title": "AI Group Tabs"
+    },
+    "permissions": [
+        "tabs",
+        "scripting",
+        "storage",
+        "tabGroups"
+    ],
+    "host_permissions": [
+        "*://docs.google.com/*",
+        "*://*.office.com/*",
+        "*://*.sharepoint.com/*",
+        "*://github.com/*/*/*",
+        "*://*.atlassian.net/*",
+        "*://*.figma.com/file/*",
+        "*://*.miro.com/app/*",
+        "*://mail.google.com/*",
+        "*://*.notion.so/*",
+        "https://ai-tab-grouper-backend-204479413902.us-central1.run.app/*"
+    ],
+    "background": {
+        "service_worker": "service-worker.js"
+    }
+}
