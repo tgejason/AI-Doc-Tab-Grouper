@@ -1,9 +1,11 @@
 // --- content-script.js ---
 
 // Check if the script has already been executed for this page
-if (!window.aiGrouperContentScriptExecuted) {
-    window.aiGrouperContentScriptExecuted = true;
-
+// if (!window.aiGrouperContentScriptExecuted) {
+//     window.aiGrouperContentScriptExecuted = true;
+// Wrap the entire file contents in an IIFE to create a new, private scope 
+// every time the script is executed.
+(function() {
     console.log("AI-Grouper Content Script: Initializing.");
     console.log("AI-Grouper Content Script: chrome.runtime object:", chrome.runtime);
 
@@ -67,4 +69,4 @@ if (!window.aiGrouperContentScriptExecuted) {
             data: errorData
         });
     }
-}
+})();
