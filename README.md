@@ -18,7 +18,7 @@ A cutting-edge Chrome Extension powered by Google Vertex AI that intelligently g
 
 ## 🚀 Demo
 
-!
+https://youtu.be/b6TN-qR3ac0
 
 > _See the extension in action as it instantly organizes your chaotic browser into focused project clusters._
 
