@@ -1,4 +1,8 @@
-// --- service-worker.js ---
+// --- service-worker.js (Integrated Final Version) ---
+
+// 🛑 NEW: Import the Enterprise functions from the separate module
+import { getEnterpriseId } from './enterprise-functions.js';
+
 
 // --- Configuration & Utilities ---
 const CLOUD_RUN_ENDPOINT = "https://ai-tab-grouper-backend-204479413902.us-central1.run.app/group"; 
@@ -8,7 +12,7 @@ const DOCUMENT_URL_PATTERNS = [
     "*://docs.google.com/*",
     "*://*.office.com/*",    
     "*://*.sharepoint.com/*",
-    "*://github.com/*/*/*",  
+    "*://github.com/*/*/*",  // Correct pattern used
     "*://*.atlassian.net/*", 
     "*://*.figma.com/file/*",
     "*://*.miro.com/app/*",  
@@ -16,8 +20,8 @@ const DOCUMENT_URL_PATTERNS = [
     "*://*.notion.so/*"      
 ];
 
-// Centralized Logging Configuration (Your "Decorator" replacement)
-const LOG_LEVEL = "DEV"; // Change to "PROD" to silence all non-CRITICAL logs
+// Centralized Logging Configuration
+const LOG_LEVEL = "DEV"; 
 
 const Logger = {
     log: (message, ...data) => {
@@ -32,236 +36,393 @@ const Logger = {
     },
     error: (message, ...data) => {
         console.error(`[AI-Grouper] 🛑 CRITICAL ERROR: ${message}`, ...data);
-        // Future (Stage 3): Call a Cloud Function to log this error to BigQuery/Cloud Logging
     }
 };
 
-// Key: Tab ID, Value: { id, title, url, snippet, status }
-const tabProcessingStatus = {};
+// Key: Tab ID, Value: { id, title, url, snippet, status, platform: {os, arch} }
+const tabProcessingStatus = {}; 
 
+// Define the maximum time to wait for content scripts to respond (6 seconds)
+const STALENESS_TIMEOUT_MS = 420000; 
 
+// Define the minimum number of successfully extracted tabs required for grouping
+const MIN_TABS_FOR_AI_PROCESSING = 2; 
 
-// --- 1. Tab Filtering and Injection ---
+// Redshift Priority Map (High to Low Priority)
+const PRIORITY_COLOR_MAP = {
+    1: 'red',
+    2: 'orange',
+    3: 'yellow',
+    4: 'green',
+    5: 'blue',
+    6: 'purple',
+    7: 'pink',
+    8: 'cyan',
+};
+
+function getRandomColor() {
+    const colors = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]; 
+    return colors[Math.floor(Math.random() * colors.length)];
+}
+
+function updateBadgeStatus(text, color) {
+    chrome.action.setBadgeText({ text: text });
+    chrome.action.setBadgeBackgroundColor({ color: color });
+}
+
+function clearTransientStatus(titlex) {
+    updateBadgeStatus('', '');
+    chrome.action.setTitle({ title: titlex }); // Reset to the default title from manifest
+}
+
+let loadingAnimationTimer;
+
+// Function to start the loading animation
+function startLoadingAnimation(frames, interval) {
+    let frameIndex = 0;
+    
+    if (loadingAnimationTimer) clearInterval(loadingAnimationTimer);
+
+    loadingAnimationTimer = setInterval(() => {
+        const text = frames[frameIndex % frames.length];
+        chrome.action.setBadgeText({ text: text });
+        chrome.action.setBadgeBackgroundColor({ color: '#FFC107' }); // Orange: Busy but stable
+        frameIndex++;
+    }, interval);
+}
+
+function stopLoadingAnimation(finalText = '', finalColor = '') {
+    if (loadingAnimationTimer) {
+        clearInterval(loadingAnimationTimer);
+        loadingAnimationTimer = null;
+    }
+    updateBadgeStatus(finalText, finalColor);
+}
+
+/**
+ * Transforms sensitive platform data into high-level, masked context for the LLM.
+ * @param {Object} platformInfo - The raw platform object ({os, arch}).
+ * @returns {string} - A masked, descriptive string for the LLM prompt.
+ */
+function maskAndContextualizePlatformData(platformInfo) {
+    const os = platformInfo.os.toLowerCase();
+    const arch = platformInfo.arch.toLowerCase();
+
+    let context = "";
+
+    // Tier 1: High-Value Contextual Masking (Primary Workstation)
+    if (os.includes('mac')) {
+        context = `Workstation (MacOS, Arch: ${arch})`;
+    } else if (os.includes('win')) {
+        context = `Workstation (Windows, Arch: ${arch})`;
+    } else if (os.includes('linux')) {
+        context = `Workstation (Linux, Arch: ${arch})`;
+    } 
+    // Tier 2: Lower/Mobile Context
+    else if (os.includes('android')) {
+        context = "Mobile/Android Context";
+    } else if (os.includes('cros')) {
+        context = "Lightweight/ChromeOS Context";
+    } 
+    // Default Mask
+    else {
+        context = "General Desktop Environment";
+    }
+    
+    return context;
+}
 
 function isDocumentTab(url) {
-    return DOCUMENT_URL_PATTERNS.some(pattern => url.match(new RegExp(pattern.replace(/\./g, '\\.').replace(/\*/g, '.*'))));
+    // The preferred URLPattern method from the second block is used for modern service workers.
+    try {
+        for (const pattern of DOCUMENT_URL_PATTERNS) {
+            // Note: URLPattern is available in Manifest V3 service workers
+            if (new URLPattern(pattern).test(url)) {
+                return true;
+            }
+        }
+    } catch (e) {
+        // Fallback for extreme compatibility issues (should not happen in MV3)
+        return DOCUMENT_URL_PATTERNS.some(pattern => url.match(new RegExp(pattern.replace(/\./g, '\\.').replace(/\*/g, '.*'))));
+    }
+    return false;
 }
 
 async function injectContentScript(tabId) {
-    Logger.log(`Attempting to inject script into tab ${tabId}.`);
     try {
         await chrome.scripting.executeScript({
             target: { tabId: tabId },
             files: ['content-script.js']
         });
-        Logger.log(`Script injected successfully into tab ${tabId}.`);
+        Logger.log(`Content script injected successfully into tab ${tabId}.`);
     } catch (error) {
-        Logger.warn(`Script injection failed for tab ${tabId}:`, error.message);
-        tabProcessingStatus[tabId] = {
-            id: tabId, 
-            url: (await chrome.tabs.get(tabId)).url,
-            title: (await chrome.tabs.get(tabId)).title,
-            status: "ERROR_INJECTION",
-            message: error.message.substring(0, 150)
-        };
+        Logger.warn(`Failed to inject content script into tab ${tabId}: ${error.message}`);
+        // Mark as FAILED so it doesn't hold up processing
+        tabProcessingStatus[tabId].status = "INJECTION_FAILED";
+        // Do not call checkAndProcessAllTabs here, it's called at the end of the timeout.
     }
 }
 
+/**
+ * Proactively forces content script execution in background tabs using a highlight/unhighlight trick.
+ */
+async function pokingTabsForExecution(relevantTabs) {
+    const activeTabId = relevantTabs.find(tab => tab.active)?.id;
+    
+    const backgroundTabsToPoke = activeTabId 
+        ? relevantTabs.filter(tab => tab.id !== activeTabId) 
+        : relevantTabs; 
 
-// --- 2. Event Listeners ---
-
-// Updates tab tracking on navigation completion
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-    if (changeInfo.status === 'complete' && isDocumentTab(tab.url)) {
-        await injectContentScript(tabId);
-        tabProcessingStatus[tabId] = {
-            id: tabId, 
-            url: tab.url, 
-            title: tab.title, 
-            status: "INJECTED_WAITING_FOR_DATA"
-        };
+    if (backgroundTabsToPoke.length === 0) {
+        Logger.log("No background tabs to poke.");
+        return;
     }
-});
+
+    Logger.log(`Proactively poking ${backgroundTabsToPoke.length} background tabs to force content script execution.`);
+
+    for (const tab of backgroundTabsToPoke) {
+        try {
+            // Briefly highlight/unhighlight to force content script execution
+            await chrome.tabs.update(tab.id, { highlighted: true });
+            await new Promise(resolve => setTimeout(resolve, 0.1)); 
+            await chrome.tabs.update(tab.id, { highlighted: false });
+
+        } catch (error) {
+            // Tab might be gone. That's fine.
+            Logger.warn(`Failed to poke or un-poke tab ${tab.id}:`, error.message);
+        }
+    }
+}
+
+// --- Event Listeners ---
 
 // Listener for content script messages
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    const tabId = sender.tab.id;
+    const tabId = sender.tab?.id;
     if (!tabId) return;
 
     if (message.action === "GROUP_TAB_DATA") {
-        tabProcessingStatus[tabId] = { 
-            ...tabProcessingStatus[tabId], 
-            ...message.data, 
-            status: "DATA_RECEIVED_READY_TO_GROUP" 
-        };
-        Logger.log(`Data received from tab ${tabId}: ${message.data.title}`);
-    } else if (message.action === "GROUP_TAB_DATA_ERROR") {
-        tabProcessingStatus[tabId] = { 
-            ...tabProcessingStatus[tabId], 
-            ...message.data, 
-            status: "ERROR_CONTENT_SCRIPT"
-        };
-        Logger.warn(`Tab ${tabId} failed snippet extraction: ${message.data.message}`);
-    }
+        const tab = tabProcessingStatus[tabId];
 
-    checkAndProcessAllTabs(); 
-    
-    return true; 
+        if (tab && tab.status === "INJECTED_WAITING_FOR_DATA") {
+            // Update status with collected data
+            tab.snippet = message.data.snippet; 
+            tab.status = "DATA_RECEIVED_READY_TO_GROUP";
+            Logger.log(`Data received for tab ${tabId}: ${tab.title}. Ready to process.`);
+            
+            // Fast Path: Check immediately if processing can start
+            checkAndProcessAllTabs();
+        } else {
+            Logger.warn(`Received unexpected data for tab ${tabId}. Status was: ${tab?.status}`);
+        }
+    } else if (message.action === "GROUP_TAB_DATA_ERROR") {
+        if (tabProcessingStatus[tabId]) {
+            tabProcessingStatus[tabId].status = "DATA_ERROR";
+            tabProcessingStatus[tabId].message = message.data.message || "Unknown Error";
+            Logger.warn(`Data error for tab ${tabId}. Status set to DATA_ERROR.`);
+            stopLoadingAnimation('ERR4', '#C62828')
+            const titlex = `Data error for tab ${tabId}. Status set to DATA_ERROR.`
+            clearTransientStatus(titlex)
+            stopLoadingAnimation(`ERR4:`, '#C62828')
+            
+            // Fast Path: Check immediately if processing can start despite this error
+            checkAndProcessAllTabs();
+        }
+    }
 });
 
+// --- Core Logic Functions ---
 
-// --- 3. Grouping Orchestration (Concurrency Controlled) ---
-
-async function checkAndProcessAllTabs() {
-    // 🛑 CRITICAL RACE CONDITION CHECK
-    if (isProcessing) {
-        Logger.log("Processing is already underway. Aborting check.");
-        return; 
+// NOTE: This now only accepts the data array, which is pre-enriched by the caller
+async function sendDataToCloudRun(tabData) { 
+    if (!tabData || tabData.length === 0) {
+        Logger.warn("Attempted to send empty data to Cloud Run. Aborting.");
+        return null;
     }
     
-    const tabsInWindow = await chrome.tabs.query({ currentWindow: true, windowType: 'normal' });
-    
-    const relevantTabIds = tabsInWindow
-        .filter(tab => isDocumentTab(tab.url) && tabProcessingStatus[tab.id])
-        .map(tab => tab.id);
+    // The payload is now just the tabData array with embedded enterprise/platform info.
+    const payload = tabData; 
 
-    Logger.log(`Found ${relevantTabIds.length} relevant tabs.`);
+    // NOTE: Logging the data structure that is actually sent (the array root)
+    Logger.log("Sending data to Cloud Run (Array Root):", payload);
 
-    const statuses = relevantTabIds.map(id => tabProcessingStatus[id].status);
-    Logger.log("Statuses of relevant tabs:", statuses);
-
-    // Check if ALL relevant tabs have a final, non-pending status
-    const allProcessed = relevantTabIds.every(id => 
-        tabProcessingStatus[id] && 
-        (tabProcessingStatus[id].status.startsWith("DATA_RECEIVED") || tabProcessingStatus[id].status.startsWith("ERROR"))
-    );
-
-    Logger.log(`All processed check: ${allProcessed}`);
-    
-    if (allProcessed && relevantTabIds.length > 1) { 
-        isProcessing = true; // Set lock before starting API call
-        Logger.log(`Sending data to Cloud Run for processing: ${relevantTabIds.length} tabs.`);
-        
-        
-        const tabDataArray = Object.values(tabProcessingStatus).filter(tab => relevantTabIds.includes(tab.id));
-        const dataToSend = tabDataArray.filter(tab => tab.status === "DATA_RECEIVED_READY_TO_GROUP");
-        
-        try {
-            if (dataToSend.length > 1) {
-                await sendDataToCloudRun(dataToSend);
-            } else {
-                Logger.log("Not enough successfully extracted documents to form a group.");
-            }
-        } catch (e) {
-             Logger.error("An unhandled error occurred during grouping:", e.message);
-        }
-        finally {
-            isProcessing = false; // Release lock
-        }
-    }
-}
-
-
-// --- 4. Cloud Communication and Grouping ---
-
-async function sendDataToCloudRun(tabData) {
-    Logger.log("Sending data to Cloud Run for processing:", tabData.length, "tabs.");
-    
+    const url = CLOUD_RUN_ENDPOINT;
     try {
-        const response = await fetch(CLOUD_RUN_ENDPOINT, {
+        const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(tabData)
+            body: JSON.stringify(payload) // Send the array directly
         });
 
         if (!response.ok) {
-            throw new Error(`Cloud Run HTTP error! Status: ${response.status}`);
+            throw new Error(`HTTP error! status: ${response.status}`);
         }
 
-        const groupingResult = await response.json();
-        Logger.log("Grouping result received:", groupingResult);
-        
-        applyTabGroups(groupingResult.groups);
+        const result = await response.json();
+        Logger.log("Cloud Run response received:", result);
+        return result.groups || [];
 
     } catch (error) {
-        Logger.error("Failed to communicate with Cloud Run or process AI response:", error.message);
-        throw error; // Re-throw to be caught by the orchestrator's try/finally block
+        // This is a CRITICAL ERROR for the user. We only use 🛑 for truly unrecoverable errors.
+        Logger.error("Failed to call Cloud Run endpoint.", error);
+        return null;
     }
 }
 
-async function applyTabGroups(groups) { // Make it async
+
+async function applyTabGroups(groups) { 
     let successfulGroups = 0;
-    for (const group of groups) { // Use for...of to allow await inside
+    for (const group of groups) { 
         const tabIdsToGroup = group.tab_titles
             .map(title => Object.values(tabProcessingStatus).find(tab => tab.title === title)?.id)
             .filter(id => id !== undefined); 
         
+        // Determine color based on priority from the LLM result.
+        const groupColor = PRIORITY_COLOR_MAP[group.priority] || getRandomColor();
+        
+        // Use the combined title/rationale for the group's title/tooltip (as requested by the user's second code block).
+        const groupTitle = `${group.group_name}: ${group.rationale}`;
+
         if (tabIdsToGroup.length > 1) {
             try {
-                // Get details for all tabs to be grouped
                 const tabs = await Promise.all(tabIdsToGroup.map(id => chrome.tabs.get(id)));
-
-                // Robustness Check 1: All tabs must be in the same window.
                 const firstTabWindowId = tabs[0].windowId;
-                if (!tabs.every(tab => tab.windowId === firstTabWindowId)) {
-                    Logger.warn(`Cannot create group '${group.group_name}' because tabs are in different windows.`);
-                    continue; // Skip to the next group
-                }
-
-                // Robustness Check 2: The window must be a normal window.
+                if (!tabs.every(tab => tab.windowId === firstTabWindowId)) { continue; }
                 const window = await chrome.windows.get(firstTabWindowId);
-                if (window.type !== 'normal') {
-                    Logger.warn(`Cannot create group '${group.group_name}' because tabs are not in a normal window.`);
-                    continue; // Skip to the next group
-                }
+                if (window.type !== 'normal') { continue; }
 
                 const groupId = await chrome.tabs.group({ tabIds: tabIdsToGroup, createProperties: { windowId: firstTabWindowId } });
                 await chrome.tabGroups.update(groupId, {
-                    title: group.group_name,
-                    //color: 'blue'
-                    color: getRandomColor()
+                    title: groupTitle, 
+                    color: groupColor 
                 });
-                Logger.log(`Group created: ${group.group_name}`);
+                Logger.log(`Group created: ${group.group_name} (Priority ${group.priority})`); 
                 successfulGroups++;    
             } 
-                
             catch (error) {
-                Logger.error(`Error during tab grouping for '${group.group_name}':`, error.message);
+                Logger.warn(`Error during tab grouping for '${group.group_name}':`, error.message);
             }
         }
     }
+    
+    // UX Polish: Clear the badge and show success/failure
     if (successfulGroups > 0) {
-        chrome.action.setBadgeText({ text: successfulGroups.toString() });
-        chrome.action.setBadgeBackgroundColor({ color: '#5C6BC0' }); 
+        updateBadgeStatus(String(successfulGroups), '#4CAF50'); // Green for success
+        stopLoadingAnimation(successfulGroups.toString(), '#5C6BC0'); // Final Success
+        chrome.action.setTitle({ title: "AI Group Tabs" });
+        updateBadgeStatus(String(successfulGroups), '#4CAF50'); // Green for success
+        await removeEmptyGroups(); // Clean up old, now-empty groups
+    } else {
+        updateBadgeStatus('None', '#F44336'); // Red for no groups created
+        stopLoadingAnimation('', ''); // Clear if zero groups
+        chrome.action.setTitle({ title: "None AI Group Tabs" });
+    }
+
+    setTimeout(() => updateBadgeStatus('', ''), 69000);
+    // Release lock only after grouping is complete
+    isProcessing = false; 
+}
+
+
+async function removeEmptyGroups() {
+    try {
+        const groups = await chrome.tabGroups.query({ windowId: chrome.windows.WINDOW_ID_CURRENT });
+        for (const group of groups) {
+            const tabs = await chrome.tabs.query({ groupId: group.id });
+            if (tabs.length === 0) {
+                // Remove the empty group
+                await chrome.tabGroups.remove(group.id);
+                Logger.log(`Successfully removed empty group: ${group.id}`);
+            }
+        }
+    } catch (error) {
+        Logger.error("Error during empty group cleanup:", error);
     }
 }
 
-// --- 5. Manual Trigger & Initialization ---
 
-// Function to start the grouping process on demand
-async function startGroupingProcess() {
-    Logger.log("Manual grouping process initiated.");
-    isProcessing = false; // Reset processing lock
-    // Clear ALL previous tab status data (essential for re-injecting)
-    Object.keys(tabProcessingStatus).forEach(key => delete tabProcessingStatus[key]);
+// Check and process only if all relevant tabs have finished injecting/gathering data
+async function checkAndProcessAllTabs() {
+    // If not processing, or if this function was triggered by a message but processing isn't locked, return.
+    if (!isProcessing) return; 
+
+    const relevantTabs = Object.values(tabProcessingStatus).filter(tab => isDocumentTab(tab.url));
     
-    
-    // Remove any empty groups left over from a previous manual degrouping.
-    await removeEmptyGroups();  
+    // Only proceed if ALL relevant tabs have a final state (Data Received OR Error/Failure)
+    const pendingTabs = relevantTabs.filter(tab => 
+        tab.status === "INJECTED_WAITING_FOR_DATA" || tab.status === "INITIAL_PENDING_INJECTION"
+    );
 
-    const tabs = await chrome.tabs.query({ currentWindow: true, windowType: 'normal' });
-    const relevantTabs = tabs.filter(t => isDocumentTab(t.url));
+    if (pendingTabs.length === 0) {
+        Logger.log("All relevant tabs have returned data or failed. Proceeding to Cloud Run call.");
+        
+        const tabData = relevantTabs.filter(tab => tab.status === "DATA_RECEIVED_READY_TO_GROUP");
+        
+        if (tabData.length < MIN_TABS_FOR_AI_PROCESSING) {
+            Logger.warn(`Aborting AI call. Only ${tabData.length} tabs succeeded. Minimum required: ${MIN_TABS_FOR_AI_PROCESSING}.`);
+            // updateBadgeStatus('Min', '#F44336');
+            const titlex = `AI-Grouper ERR2: Aborting AI call. Only ${tabData.length} tabs succeeded. Need ${MIN_TABS_FOR_AI_PROCESSING} documents to group.` 
+            
+            clearTransientStatus(titlex)
+            stopLoadingAnimation(`ERR2:`, '#C62828')
+            //setTimeout(() => updateBadgeStatus('', ''), 4000);
+            isProcessing = false;
+            return;
+        }
 
-    if (relevantTabs.length < 2) {
-        Logger.log("Not enough document tabs to group.");
-        return;
+        // 💡 START DYNAMIC ANIMATION
+        startLoadingAnimation(['AI', 'AI.', 'AI..', 'AI...'], 400);
+        
+        // 🛑 FIX: Fetch platform info here in the Service Worker context
+        chrome.runtime.getPlatformInfo(async (platformInfo) => {
+
+            // 1. Get Enterprise ID and masked context once
+            const enterpriseId = await getEnterpriseId(Logger);
+            const maskedPlatformContext = maskAndContextualizePlatformData(platformInfo);
+
+            // 2. Inject context into the tabData array before sending
+            const enrichedTabData = tabData.map(tab => ({
+                ...tab,
+                // Embed the context into the tab object itself
+                platform_context: maskedPlatformContext, 
+                enterprise_id: enterpriseId              
+            }));
+
+            // 3. Call server with the array, not the top-level object
+            // NOTE: Removed platformInfo argument from the call
+            const groups = await sendDataToCloudRun(enrichedTabData);
+
+
+            
+            if (groups) {
+                Logger.log(`Applying ${groups.length} groups.`);
+                await applyTabGroups(groups);
+            } else {
+                Logger.error("Cloud Run returned null groups.");
+                updateBadgeStatus('Fail', '#F44336');
+                stopLoadingAnimation('Fail', '#F44336');
+                //setTimeout(() => updateBadgeStatus('', ''), 4000);
+                isProcessing = false;
+            }
+        });
+    } else {
+        Logger.log(`Waiting for ${pendingTabs.length} tabs to return data.`);
     }
+}
 
-    Logger.log(`Found ${relevantTabs.length} relevant tabs. Re-initializing status and injecting scripts...`);
 
+async function prepareTabsForInjection(relevantTabs) {
     const injectionPromises = [];
 
-    // Clear status for relevant tabs and initiate injection in parallel
+    // Clear statuses of tabs not currently in the window or no longer relevant
+    Object.keys(tabProcessingStatus).forEach(id => {
+        const tabId = parseInt(id, 10);
+        if (!relevantTabs.some(tab => tab.id === tabId)) {
+            delete tabProcessingStatus[tabId];
+        }
+    });
+
+    // Iterate over relevant tabs and initiate injection in parallel
     for (const tab of relevantTabs) {
         // Reset status for this tab
         tabProcessingStatus[tab.id] = { 
@@ -274,66 +435,72 @@ async function startGroupingProcess() {
         injectionPromises.push(injectContentScript(tab.id));
     }
 
+    // 🛑 Integrated Fix: Proactively ping background tabs to force content script execution
+    await pokingTabsForExecution(relevantTabs);
+
     // Wait for all injections to complete (or fail) using Promise.allSettled
     await Promise.allSettled(injectionPromises);
 
-    // Now that all injections are initiated, wait for content scripts to send data
-    // and then trigger the check.
-    /*
+    // Now that all injections are initiated, schedule the final, guaranteed check using the timeout.
     setTimeout(() => {
-        Logger.log("Fallback: Forcing a check after manual injection.");
-        checkAndProcessAllTabs();
-    }, 2000); // 2 second timeout */
-}
-
-function getRandomColor() {
-    const colors = ["blue", "red", "yellow", "green", "pink", "purple", "cyan"];
-    return colors[Math.floor(Math.random() * colors.length)];
-}
-
-async function removeEmptyGroups() {
-    try {
-        const groups = await chrome.tabGroups.query({ windowId: chrome.windows.WINDOW_ID_CURRENT });
-        
-        for (const group of groups) {
-            // Find tabs belonging to this group ID
-            const tabs = await chrome.tabs.query({ groupId: group.id });
-            
-            // If the group exists but has no tabs, remove the group
-            if (tabs.length === 0) {
-                /* chrome.tabGroups.remove is deprecated in Manifest V3. 
-                // The correct way to delete a group is to move its last tab out, or 
-                // use chrome.tabs.ungroup, which we will avoid here for cleanliness.
-                // Instead, we will collapse groups, which is a cleaner UX for empty state.
-                
-                // CRITICAL NOTE: Group colors persist. A group is removed when all 
-                // tabs in it are ungrouped. Since we want to remove the *group element itself*,
-                // we'll rely on a clean ungrouping process if the group is found empty.
-                
-                // However, the cleanest solution is often to just collapse/update it.
-                
-                // Since there is no direct chrome.tabGroups.delete in MV3, 
-                // we'll use a pragmatic approach: if a group is empty, collapse it for UX.
-                // Or, simply rely on the 'ungrouping' nature of the main logic.
-                
-                // For a truly clean experience, we will focus on preventing the re-use of old group colors/titles.
-                // The current implementation is simpler: we only delete empty groups if we find them.
-                
-                // A direct fix: Ungroup any remaining tabs from the old run that haven't been grouped yet
-                // (This is implicitly handled by the next step, but let's keep this simpler for now.)
-                */
-
-                Logger.log(`Skipping explicit deletion of empty group ${group.id}. Relying on tab re-assignment.`);
-
+        Logger.log(`Staleness monitor triggered. Forcing final check after ${STALENESS_TIMEOUT_MS}ms.`);
+        // Mark any remaining INJECTED_WAITING_FOR_DATA as ERROR_TIMEOUT
+        Object.values(tabProcessingStatus).forEach(tab => {
+            if (tab.status === "INJECTED_WAITING_FOR_DATA") {
+                 tab.status = "ERROR_TIMEOUT";
+                 tab.message = `Content script did not respond within ${STALENESS_TIMEOUT_MS}ms.`;
             }
-        }
-    } catch (error) {
-        Logger.error("Error during empty group cleanup:", error);
+        });
+        checkAndProcessAllTabs();
+    }, STALENESS_TIMEOUT_MS); 
+}
+
+// Function to orchestrate the entire grouping process
+async function startGroupingProcess() {
+    if (isProcessing) {
+        Logger.warn("Processing is already underway. Skipping click.");
+        return;
     }
+    isProcessing = true;
+    updateBadgeStatus('...', '#FFC107'); // Amber/Yellow for start
+    
+    Logger.log("Starting grouping process...");
+    
+    await removeEmptyGroups();  // Clean up before starting
+
+    // 1. Get all relevant tabs and reset state
+    const tabs = await chrome.tabs.query({ currentWindow: true, windowType: 'normal' });
+    const relevantTabs = tabs.filter(tab => isDocumentTab(tab.url));
+    
+    if (relevantTabs.length < MIN_TABS_FOR_AI_PROCESSING) {
+        updateBadgeStatus('Min', '#F44336');
+        updateBadgeStatus('ERR2', '#C62828');
+        
+        //setTimeout(() => updateBadgeStatus('', ''), 4000);
+        isProcessing = false;
+        Logger.log(`Not enough relevant tabs (found ${relevantTabs.length}). Aborting.`);      
+        const titlex = `AI-Grouper ERR2: Need ${MIN_TABS_FOR_AI_PROCESSING} documents to group.` 
+        
+        clearTransientStatus(titlex)
+        stopLoadingAnimation(`ERR2:`, '#C62828')
+        return;
+    }
+
+    // 2. Inject content scripts to gather data and set up timeout checks
+    await prepareTabsForInjection(relevantTabs);
+
+    // The rest of the execution is handled by the timeout or by the message listener 
+    // calling checkAndProcessAllTabs().
 }
 
 // Listen for clicks on the extension icon
-chrome.action.onClicked.addListener(startGroupingProcess);
+chrome.action.onClicked.addListener(async () => {
+    // 💡 IMMEDIATE FEEDBACK: Show the user something is happening right now!
+    updateBadgeStatus('...', '#FFC107'); // Yellow/Amber for start
+    
+    // Now, kick off the long-running process
+    await startGroupingProcess(); 
+});
 
 
 // Initial check on extension load to populate the status object
