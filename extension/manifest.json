@@ -28,6 +28,7 @@
         "https://ai-tab-grouper-backend-204479413902.us-central1.run.app/*"
     ],
     "background": {
-        "service_worker": "service-worker.js"
+        "service_worker": "service-worker.js",
+        "type": "module"
     }
 }
